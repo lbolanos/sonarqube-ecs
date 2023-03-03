@@ -1,0 +1,829 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The template used to create an ECS Cluster from the ECS Console.
+Parameters:
+  ECSClusterName:
+    Type: String
+    Description: >-
+      Specifies the ECS Cluster Name with which the resources would be
+      associated
+    Default: SonarQubeV4
+  VpcId:
+    Type: String
+    Description: >-
+      Optional - Specifies the ID of an existing VPC in which to launch your
+      container instances. If you specify a VPC ID, you must specify a list of
+      existing subnets in that VPC. If you do not specify a VPC ID, a new VPC is
+      created with atleast 1 subnet.
+    Default: 'vpc-9999999'
+    AllowedPattern: '^(?:vpc-[0-9a-f]{8,17}|)$'
+    ConstraintDescription: VPC Id must begin with 'vpc-' and have a valid uuid
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: >-
+      Optional - Specifies the Comma separated list of existing VPC Subnet Ids
+      where ECS instances will run
+    Default: 'subnet-11111111,subnet-222222,subnet-3333333,subnet-444444444333,subnet-5555555,subnet-66666'
+  LatestECSOptimizedAMI:
+    Description: AMI ID
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+  UserData:
+    Type: String
+    Description: User data required for Launch Template and Spot Fleet
+    Default: |-
+      #!/bin/bash 
+      echo ECS_CLUSTER=SonarQubeV4 >> /etc/ecs/ecs.config;
+  IamRoleInstanceProfile:
+    Type: String
+    Description: >-
+      Specifies the Name or the Amazon Resource Name (ARN) of the instance
+      profile associated with the IAM role for the instance
+    Default: 'arn:aws:iam::8888888:instance-profile/ecsInstanceRole'
+Resources:
+  ECSLaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    DependsOn: Cluster
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestECSOptimizedAMI
+        InstanceType: t3.medium
+        KeyName: cariai
+        IamInstanceProfile:
+          Arn: !Ref IamRoleInstanceProfile
+        UserData: !Base64
+          Ref: UserData
+  ECSAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchTemplate
+        Version: !GetAtt
+          - ECSLaunchTemplate
+          - LatestVersionNumber
+      VPCZoneIdentifier: !Ref SubnetIds
+  CloudMap:
+    Properties:
+      Description: Service Map for Docker Compose project sonarqube
+      Name: sonarqube.local
+      Vpc: vpc-9999999
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ECSClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      ServiceConnectDefaults:
+        Namespace: SonarQubeV4
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+  EC2CapacityProvider:
+    Type: 'AWS::ECS::CapacityProvider'
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref ECSAutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100
+        ManagedTerminationProtection: DISABLED
+  ClusterCPAssociation:
+    Type: 'AWS::ECS::ClusterCapacityProviderAssociations'
+    Properties:
+      Cluster: SonarQubeV4
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+        - !Ref EC2CapacityProvider
+      DefaultCapacityProviderStrategy:
+        - Base: 0
+          Weight: 1
+          CapacityProvider: !Ref EC2CapacityProvider
+  DbService:
+    DependsOn:
+    - PostgresqldataNFSMountTargetOnSubnet5555555
+    - PostgresqldataNFSMountTargetOnSubnet444444444333
+    - PostgresqldataNFSMountTargetOnSubnet3333333
+    - PostgresqldataNFSMountTargetOnSubnet66666
+    - PostgresqldataNFSMountTargetOnSubnet222222
+    - PostgresqldataNFSMountTargetOnSubnet11111111
+    Properties:
+      Cluster:
+        Fn::GetAtt:
+        - Cluster
+        - Arn
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      DeploymentController:
+        Type: ECS
+      #DesiredCount: 1
+      LaunchType: EC2
+      SchedulingStrategy: DAEMON
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+          - Ref: SonarnetNetwork
+          Subnets:
+          - subnet-5555555
+          - subnet-444444444333
+          - subnet-3333333
+          - subnet-66666
+          - subnet-222222
+          - subnet-11111111
+      #PlatformVersion: 1.4.0
+      #PropagateTags: SERVICE
+      #SchedulingStrategy: REPLICA
+      ServiceRegistries:
+      - RegistryArn:
+          Fn::GetAtt:
+          - DbServiceDiscoveryEntry
+          - Arn
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.service
+        Value: db
+      TaskDefinition:
+        Ref: DbTaskDefinition
+    Type: AWS::ECS::Service
+  DbServiceDiscoveryEntry:
+    Properties:
+      Description: '"db" service discovery entry in Cloud Map'
+      DnsConfig:
+        DnsRecords:
+        - TTL: 60
+          Type: A
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: db
+      NamespaceId:
+        Ref: CloudMap
+    Type: AWS::ServiceDiscovery::Service
+  DbTaskDefinition:
+    Properties:
+      ContainerDefinitions:
+      - Command:
+        - us-east-1.compute.internal
+        - sonarqube.local
+        Essential: false
+        Image: docker/ecs-searchdomain-sidecar:1.0
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: LogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: sonarqube
+        Name: Db_ResolvConf_InitContainer
+      - DependsOn:
+        - Condition: SUCCESS
+          ContainerName: Db_ResolvConf_InitContainer
+        Environment:
+        - Name: POSTGRES_DB
+          Value: sonar
+        - Name: POSTGRES_PASSWORD
+          Value: sonar
+        - Name: POSTGRES_USER
+          Value: sonar
+        Essential: true
+        Image: docker.io/library/postgres:latest@sha256:50a96a21f2992518c2cb4601467cf27c7ac852542d8913c1872fe45cd6449947
+        LinuxParameters: {}
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: LogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: sonarqube
+        MountPoints:
+        - ContainerPath: /var/lib/postgresql/data
+          SourceVolume: postgresql_data
+        Name: db
+      Cpu: "512"
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Ref: DbTaskExecutionRole
+      Family: sonarqube-db
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - EC2
+      TaskRoleArn:
+        Ref: DbTaskRole
+      Volumes:
+      - EFSVolumeConfiguration:
+          AuthorizationConfig:
+            AccessPointId:
+              Ref: PostgresqldataAccessPoint
+            IAM: ENABLED
+          FilesystemId:
+            Ref: PostgresqldataFilesystem
+          TransitEncryption: ENABLED
+        Name: postgresql_data
+    Type: AWS::ECS::TaskDefinition
+  DbTaskExecutionRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Condition: {}
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.service
+        Value: db
+    Type: AWS::IAM::Role
+  DbTaskRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Condition: {}
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - elasticfilesystem:ClientMount
+            - elasticfilesystem:ClientWrite
+            - elasticfilesystem:ClientRootAccess
+            Condition:
+              StringEquals:
+                elasticfilesystem:AccessPointArn:
+                  Ref: PostgresqldataAccessPoint
+            Effect: Allow
+            Principal: {}
+            Resource:
+            - Fn::GetAtt:
+              - PostgresqldataFilesystem
+              - Arn
+          Version: 2012-10-17
+        PolicyName: DbPostgresqldataVolumeMountPolicy
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.service
+        Value: db
+    Type: AWS::IAM::Role
+  LogGroup:
+    Properties:
+      LogGroupName: /docker-compose/sonarqube
+      RetentionInDays: 14
+    Type: AWS::Logs::LogGroup
+  PostgresqldataAccessPoint:
+    Properties:
+      AccessPointTags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.volume
+        Value: postgresql_data
+      - Key: Name
+        Value: sonarqube_postgresql_data
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+    Type: AWS::EFS::AccessPoint
+  PostgresqldataFilesystem:
+    DeletionPolicy: Retain
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.volume
+        Value: postgresql_data
+      - Key: Name
+        Value: sonarqube_postgresql_data
+    Type: AWS::EFS::FileSystem
+  PostgresqldataNFSMountTargetOnSubnet5555555:
+    Properties:
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-5555555
+    Type: AWS::EFS::MountTarget
+  PostgresqldataNFSMountTargetOnSubnet3333333:
+    Properties:
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-3333333
+    Type: AWS::EFS::MountTarget
+  PostgresqldataNFSMountTargetOnSubnet444444444333:
+    Properties:
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-444444444333
+    Type: AWS::EFS::MountTarget
+  PostgresqldataNFSMountTargetOnSubnet222222:
+    Properties:
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-222222
+    Type: AWS::EFS::MountTarget
+  PostgresqldataNFSMountTargetOnSubnet66666:
+    Properties:
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-66666
+    Type: AWS::EFS::MountTarget
+  PostgresqldataNFSMountTargetOnSubnet11111111:
+    Properties:
+      FileSystemId:
+        Ref: PostgresqldataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-11111111
+    Type: AWS::EFS::MountTarget
+  Sonarnet9000Ingress:
+    Properties:
+      CidrIp: 0.0.0.0/0
+      Description: sonarqube:9000/ on sonarnet network
+      FromPort: 9000
+      GroupId:
+        Ref: SonarnetNetwork
+      IpProtocol: "-1"
+      ToPort: 9000
+    Type: AWS::EC2::SecurityGroupIngress
+  SonarnetNetwork:
+    Properties:
+      GroupDescription: sonarqube Security Group for sonarnet network
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.network
+        Value: sonarqube_sonarnet
+      VpcId: vpc-9999999
+    Type: AWS::EC2::SecurityGroup
+  SonarnetNetworkIngress:
+    Properties:
+      Description: Allow communication within network sonarnet
+      GroupId:
+        Ref: SonarnetNetwork
+      IpProtocol: "-1"
+      SourceSecurityGroupId:
+        Ref: SonarnetNetwork
+    Type: AWS::EC2::SecurityGroupIngress
+  Sonarqube9000Listener:
+    Properties:
+      DefaultActions:
+      - ForwardConfig:
+          TargetGroups:
+          - TargetGroupArn:
+              Ref: Sonarqube9000TargetGroup
+        Type: forward
+      LoadBalancerArn: arn:aws:elasticloadbalancing:us-east-1:8888888:loadbalancer/app/CariAiWeb/777777777
+      Port: 9000
+      Protocol: HTTP
+    Type: AWS::ElasticLoadBalancingV2::Listener
+#  ListenerRule:
+#    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+#    Properties:
+#      Actions:
+#        - Type: forward
+#          TargetGroupArn: !Ref Sonarqube9000TargetGroup
+#      Conditions:
+#        - Field: host-header
+#          Values:
+#            - sonarqube.cariai.com
+#      ListenerArn: >-
+#        arn:aws:elasticloadbalancing:us-east-1:8888888:listener/app/test/e22ddec709927c40/1b31610f04223726
+#      Priority: '1'
+  Sonarqube9000TargetGroup:
+    Properties:
+      Port: 9000
+      Protocol: HTTP
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      TargetType: ip
+      VpcId: vpc-9999999
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+  SonarqubeService:
+    DependsOn:
+    - Sonarqube9000Listener
+    - DbService
+    - SonarqubedataNFSMountTargetOnSubnet5555555
+    - SonarqubedataNFSMountTargetOnSubnet444444444333
+    - SonarqubedataNFSMountTargetOnSubnet3333333
+    - SonarqubedataNFSMountTargetOnSubnet66666
+    - SonarqubedataNFSMountTargetOnSubnet222222
+    - SonarqubedataNFSMountTargetOnSubnet11111111
+    - SonarqubelogsNFSMountTargetOnSubnet5555555
+    - SonarqubelogsNFSMountTargetOnSubnet444444444333
+    - SonarqubelogsNFSMountTargetOnSubnet3333333
+    - SonarqubelogsNFSMountTargetOnSubnet66666
+    - SonarqubelogsNFSMountTargetOnSubnet222222
+    - SonarqubelogsNFSMountTargetOnSubnet11111111
+    Properties:
+      Cluster:
+        Fn::GetAtt:
+        - Cluster
+        - Arn
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      DeploymentController:
+        Type: ECS
+      #DesiredCount: 1
+      LaunchType: EC2
+      SchedulingStrategy: DAEMON
+      LoadBalancers:
+      - ContainerName: sonarqube
+        ContainerPort: 9000
+        TargetGroupArn:
+          Ref: Sonarqube9000TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+          - Ref: SonarnetNetwork
+          Subnets:
+          - subnet-5555555
+          - subnet-444444444333
+          - subnet-3333333
+          - subnet-66666
+          - subnet-222222
+          - subnet-11111111
+      #PlatformVersion: 1.4.0
+      #PropagateTags: SERVICE
+      #SchedulingStrategy: REPLICA
+      ServiceRegistries:
+      - RegistryArn:
+          Fn::GetAtt:
+          - SonarqubeServiceDiscoveryEntry
+          - Arn
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.service
+        Value: sonarqube
+      TaskDefinition:
+        Ref: SonarqubeTaskDefinition
+    Type: AWS::ECS::Service
+  SonarqubeServiceDiscoveryEntry:
+    Properties:
+      Description: '"sonarqube" service discovery entry in Cloud Map'
+      DnsConfig:
+        DnsRecords:
+        - TTL: 60
+          Type: A
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: sonarqube
+      NamespaceId:
+        Ref: CloudMap
+    Type: AWS::ServiceDiscovery::Service
+  SonarqubeTaskDefinition:
+    Properties:
+      ContainerDefinitions:
+      - Command:
+        - us-east-1.compute.internal
+        - sonarqube.local
+        Essential: false
+        Image: docker/ecs-searchdomain-sidecar:1.0
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: LogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: sonarqube
+        Name: Sonarqube_ResolvConf_InitContainer
+      - DependsOn:
+        - Condition: SUCCESS
+          ContainerName: Sonarqube_ResolvConf_InitContainer
+        Environment:
+        - Name: SONAR_JDBC_PASSWORD
+          Value: sonar
+        - Name: SONAR_JDBC_URL
+          Value: jdbc:postgresql://db/sonar
+        - Name: SONAR_JDBC_USERNAME
+          Value: sonar
+        Essential: true
+        Image: docker.io/lbolanos/sonarqubev4:v10
+        LinuxParameters: {}
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: LogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: sonarqube
+        MountPoints:
+        - ContainerPath: /opt/sonarqube/data
+          SourceVolume: sonarqube_data
+        - ContainerPath: /opt/sonarqube/logs
+          SourceVolume: sonarqube_logs
+        Name: sonarqube
+        PortMappings:
+        - ContainerPort: 9000
+          HostPort: 9000
+      # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
+      # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
+      # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
+      # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
+      # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
+      Cpu: "1024"
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        cpuArchitecture: X86_64
+      ExecutionRoleArn:
+        Ref: SonarqubeTaskExecutionRole
+      Family: sonarqube-sonarqube
+      # 0.5GB, 1GB, 2GB - Available cpu values: 256 (.25 vCPU)
+      # 1GB, 2GB, 3GB, 4GB - Available cpu values: 512 (.5 vCPU)
+      # 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB - Available cpu values: 1024 (1 vCPU)
+      # Between 4GB and 16GB in 1GB increments - Available cpu values: 2048 (2 vCPU)
+      # Between 8GB and 30GB in 1GB increments - Available cpu values: 4096 (4 vCPU)
+      Memory: "2GB"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - EC2
+      TaskRoleArn:
+        Ref: SonarqubeTaskRole
+      Volumes:
+      - EFSVolumeConfiguration:
+          AuthorizationConfig:
+            AccessPointId:
+              Ref: SonarqubedataAccessPoint
+            IAM: ENABLED
+          FilesystemId:
+            Ref: SonarqubedataFilesystem
+          TransitEncryption: ENABLED
+        Name: sonarqube_data
+      - EFSVolumeConfiguration:
+          AuthorizationConfig:
+            AccessPointId:
+              Ref: SonarqubelogsAccessPoint
+            IAM: ENABLED
+          FilesystemId:
+            Ref: SonarqubelogsFilesystem
+          TransitEncryption: ENABLED
+        Name: sonarqube_logs
+    Type: AWS::ECS::TaskDefinition
+  SonarqubeTaskExecutionRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Condition: {}
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.service
+        Value: sonarqube
+    Type: AWS::IAM::Role
+  SonarqubeTaskRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Condition: {}
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - elasticfilesystem:ClientMount
+            - elasticfilesystem:ClientWrite
+            - elasticfilesystem:ClientRootAccess
+            Condition:
+              StringEquals:
+                elasticfilesystem:AccessPointArn:
+                  Ref: SonarqubedataAccessPoint
+            Effect: Allow
+            Principal: {}
+            Resource:
+            - Fn::GetAtt:
+              - SonarqubedataFilesystem
+              - Arn
+          Version: 2012-10-17
+        PolicyName: SonarqubeSonarqubedataVolumeMountPolicy
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - elasticfilesystem:ClientMount
+            - elasticfilesystem:ClientWrite
+            - elasticfilesystem:ClientRootAccess
+            Condition:
+              StringEquals:
+                elasticfilesystem:AccessPointArn:
+                  Ref: SonarqubelogsAccessPoint
+            Effect: Allow
+            Principal: {}
+            Resource:
+            - Fn::GetAtt:
+              - SonarqubelogsFilesystem
+              - Arn
+          Version: 2012-10-17
+        PolicyName: SonarqubeSonarqubelogsVolumeMountPolicy
+      Tags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.service
+        Value: sonarqube
+    Type: AWS::IAM::Role
+  SonarqubedataAccessPoint:
+    Properties:
+      AccessPointTags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.volume
+        Value: sonarqube_data
+      - Key: Name
+        Value: sonarqube_sonarqube_data
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      PosixUser:
+        Gid: "0"
+        Uid: "0"
+    Type: AWS::EFS::AccessPoint
+  SonarqubedataFilesystem:
+    DeletionPolicy: Retain
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.volume
+        Value: sonarqube_data
+      - Key: Name
+        Value: sonarqube_sonarqube_data
+    Type: AWS::EFS::FileSystem
+  SonarqubedataNFSMountTargetOnSubnet5555555:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-5555555
+    Type: AWS::EFS::MountTarget
+  SonarqubedataNFSMountTargetOnSubnet3333333:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-3333333
+    Type: AWS::EFS::MountTarget
+  SonarqubedataNFSMountTargetOnSubnet444444444333:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-444444444333
+    Type: AWS::EFS::MountTarget
+  SonarqubedataNFSMountTargetOnSubnet222222:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-222222
+    Type: AWS::EFS::MountTarget
+  SonarqubedataNFSMountTargetOnSubnet66666:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-66666
+    Type: AWS::EFS::MountTarget
+  SonarqubedataNFSMountTargetOnSubnet11111111:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubedataFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-11111111
+    Type: AWS::EFS::MountTarget
+  SonarqubelogsAccessPoint:
+    Properties:
+      AccessPointTags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.volume
+        Value: sonarqube_logs
+      - Key: Name
+        Value: sonarqube_sonarqube_logs
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      PosixUser:
+        Gid: "0"
+        Uid: "0"
+    Type: AWS::EFS::AccessPoint
+  SonarqubelogsFilesystem:
+    DeletionPolicy: Retain
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+      - Key: com.docker.compose.project
+        Value: sonarqube
+      - Key: com.docker.compose.volume
+        Value: sonarqube_logs
+      - Key: Name
+        Value: sonarqube_sonarqube_logs
+    Type: AWS::EFS::FileSystem
+  SonarqubelogsNFSMountTargetOnSubnet5555555:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-5555555
+    Type: AWS::EFS::MountTarget
+  SonarqubelogsNFSMountTargetOnSubnet3333333:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-3333333
+    Type: AWS::EFS::MountTarget
+  SonarqubelogsNFSMountTargetOnSubnet444444444333:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-444444444333
+    Type: AWS::EFS::MountTarget
+  SonarqubelogsNFSMountTargetOnSubnet222222:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-222222
+    Type: AWS::EFS::MountTarget
+  SonarqubelogsNFSMountTargetOnSubnet66666:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-66666
+    Type: AWS::EFS::MountTarget
+  SonarqubelogsNFSMountTargetOnSubnet11111111:
+    Properties:
+      FileSystemId:
+        Ref: SonarqubelogsFilesystem
+      SecurityGroups:
+      - Ref: SonarnetNetwork
+      SubnetId: subnet-11111111
+    Type: AWS::EFS::MountTarget
